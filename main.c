@@ -1,119 +1,172 @@
 #include "main.h"
-
-static
-HANDLE
-ds_open_handle(
-	PWCHAR pwPath
-)
+static HANDLE DsOpenHandle(PWCHAR Path)
 {
-	return CreateFileW(pwPath, DELETE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	UNICODE_STRING NtPath;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    IO_STATUS_BLOCK IoStatusBlock;
+    HANDLE File;
+	NTSTATUS Status;
+	
+	RtlDosPathNameToNtPathName_U(Path, &NtPath, NULL, NULL);
+	
+	InitializeObjectAttributes(&ObjectAttributes,
+							   &NtPath,
+							   OBJ_CASE_INSENSITIVE,
+							   NULL,
+							   NULL);
+							   
+	Status = NtCreateFile(&File,
+						  DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+						  &ObjectAttributes,
+						  &IoStatusBlock,
+						  NULL,
+						  FILE_ATTRIBUTE_NORMAL,
+						  0,
+						  FILE_OPEN,
+						  FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+						  NULL,
+						  0);
+	
+	RtlFreeHeap(RtlProcessHeap(), 0, NtPath.Buffer);
+	
+	if (NT_SUCCESS(Status)) {
+		RtlSetLastWin32Error(ERROR_SUCCESS);
+	} else {
+		RtlSetLastWin32ErrorAndNtStatusFromNtStatus(Status);
+		File = INVALID_HANDLE_VALUE;
+	}
+	return File;
 }
 
-static
-void *
-ds_rename_handle(
-	HANDLE hHandle
-)
+static PVOID DsRenameHandle(HANDLE Handle)
 {
-	LPCWSTR lpwStream = DS_STREAM_RENAME;
-	PFILE_RENAME_INFO pfRename = (PFILE_RENAME_INFO)malloc(sizeof(FILE_RENAME_INFO) + sizeof(WCHAR) * wcslen(lpwStream)); // FILE_RENAME_INFO contains space for 1 WCHAR without NULL-byte
-	if(pfRename == NULL)
-	{
-		DS_DEBUG_LOG(L"could not allocate memory");
+	LPCWSTR Stream = DS_STREAM_RENAME;
+	SIZE_T BufSize = sizeof(FILE_RENAME_INFO) + sizeof(DS_STREAM_RENAME) - sizeof(WCHAR);
+	PFILE_RENAME_INFO Rename = (PFILE_RENAME_INFO)RtlAllocateHeap(RtlProcessHeap(), 0, BufSize); // FILE_RENAME_INFO contains space for 1 WCHAR without NULL-byte
+	if (Rename == NULL) {
+		DS_DEBUG_LOG(L"Could not allocate memory");
 		return NULL;
 	}
-	RtlSecureZeroMemory(pfRename, sizeof(FILE_RENAME_INFO) + sizeof(WCHAR) * wcslen(lpwStream));
+	RtlZeroMemory(Rename, BufSize);
 
 	// set our FileNameLength and FileName to DS_STREAM_RENAME
-	pfRename->FileNameLength = (DWORD)(sizeof(WCHAR) * wcslen(lpwStream));
-	RtlCopyMemory(pfRename->FileName, lpwStream, sizeof(WCHAR) * (wcslen(lpwStream) + 1));
+	Rename->FileNameLength = (DWORD)(sizeof(DS_STREAM_RENAME) - sizeof(WCHAR));
+	RtlCopyMemory(Rename->FileName, Stream, sizeof(DS_STREAM_RENAME));
 
-	BOOL fRenameOk = SetFileInformationByHandle(hHandle, FileRenameInfo, pfRename, (DWORD)(sizeof(FILE_RENAME_INFO) + sizeof(WCHAR) * wcslen(lpwStream)));
-	if(!fRenameOk)
+	BOOL RenameOk;
+	NTSTATUS Status;
+    IO_STATUS_BLOCK IoStatusBlock;
+	
+	Status = NtSetInformationFile(Handle, &IoStatusBlock, Rename, BufSize, FileRenameInformation);
+	
+	if (!NT_SUCCESS(Status)) {
+		RtlSetLastWin32ErrorAndNtStatusFromNtStatus(Status);
+		RenameOk = FALSE;
+	} else {
+		RenameOk = TRUE;
+	}
+	
+	if(!RenameOk)
 	{
-		free(pfRename);
+		RtlFreeHeap(RtlProcessHeap(), 0, Rename);
 		return NULL;
 	}
-	return pfRename;
+	return Rename;
 }
 
-static
-BOOL 
-ds_deposite_handle(
-	HANDLE hHandle
-)
+static BOOL DsDepositeHandle(HANDLE Handle)
 {
 	// Ref: https://cybersecuritynews.com/windows-11-24h2-disrupts-self-delete/
-	FILE_DISPOSITION_INFO_EX fDeleteEx;
-	RtlSecureZeroMemory(&fDeleteEx, sizeof(fDeleteEx));
+	FILE_DISPOSITION_INFO_EX DeleteEx;
+	RtlZeroMemory(&DeleteEx, sizeof(DeleteEx));
 
-	fDeleteEx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+	DeleteEx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+	NTSTATUS Status;
+    IO_STATUS_BLOCK IoStatusBlock;
 
-	return SetFileInformationByHandle(hHandle, FileDispositionInfoEx, &fDeleteEx, sizeof(fDeleteEx));
+	Status = NtSetInformationFile(Handle, &IoStatusBlock, &DeleteEx, sizeof(DeleteEx), FileDispositionInformationEx);
+	RtlSetLastWin32ErrorAndNtStatusFromNtStatus(Status);
+	return NT_SUCCESS(Status);
 }
 
-int
-main(
-	int argc,
-	char** argv
-)
+int wmain(int argc, wchar_t **argv)
 {
-	WCHAR wcPath[MAX_PATH + 1];
-	RtlSecureZeroMemory(wcPath, sizeof(wcPath));
-
-	// get the path to the current running process ctx
-	if (GetModuleFileNameW(NULL, wcPath, MAX_PATH) == 0)
-	{
-		DS_DEBUG_LOG(L"failed to get the current module handle");
-		return 0;
+	WCHAR Path[MAX_PATH + 1];
+	RtlZeroMemory(Path, sizeof(Path));
+	
+	UNICODE_STRING Name;
+	NTSTATUS Status;
+	DWORD Len = 0;
+    PPEB Peb = (PPEB)NtCurrentPeb();
+	
+	if (Peb != NULL && Peb->ProcessParameters != NULL) {
+		UNICODE_STRING *ImageName = &Peb->ProcessParameters->ImagePathName;
+		if (ImageName->Length > 0 && ImageName->Buffer != NULL) {
+			Name.Buffer = Path;
+			Name.MaximumLength = sizeof(Path);
+			RtlCopyMemory(Path, ImageName->Buffer, min(ImageName->Length + sizeof(WCHAR), Name.MaximumLength));
+			if (ImageName->Length + sizeof(WCHAR) < Name.MaximumLength) {
+				Path[ImageName->Length / sizeof(WCHAR)] = L'\0';
+				Status = STATUS_SUCCESS;
+			} else {
+				Path[ImageName->MaximumLength / sizeof(WCHAR)] = L'\0';
+				Status = STATUS_BUFFER_TOO_SMALL;
+            }
+			Name.Length = ImageName->Length;
+		}
 	}
 
-	HANDLE hCurrent = ds_open_handle(wcPath);
-	if (hCurrent == INVALID_HANDLE_VALUE)
-	{
-		DS_DEBUG_LOG(L"failed to acquire handle to current running process");
-		return 0;
+    if (NT_SUCCESS(Status) || Status == STATUS_BUFFER_TOO_SMALL) {
+		Len = Name.Length * sizeof(WCHAR);
+		RtlSetLastWin32ErrorAndNtStatusFromNtStatus(Status);
+	}
+
+    if (Len == 0) {
+        DS_DEBUG_LOG(L"Failed to get the current module path via PEB");
+        return NtCurrentTeb()->LastErrorValue;
+    }
+
+	HANDLE Current = DsOpenHandle(Path);
+	if (Current == INVALID_HANDLE_VALUE) {
+		DS_DEBUG_LOG(L"Failed to acquire handle to current running process");
+		return NtCurrentTeb()->LastErrorValue;
 	}
 
 	// rename the associated HANDLE's file name
-	DS_DEBUG_LOG(L"attempting to rename file name");
-	void *pfRename = ds_rename_handle(hCurrent);
-	if (pfRename == NULL)
-	{
-		DS_DEBUG_LOG(L"failed to rename to stream");
-		return 0;
+	DS_DEBUG_LOG(L"Attempting to rename file name");
+	PVOID Rename = DsRenameHandle(Current);
+	if (Rename == NULL) {
+		DS_DEBUG_LOG(L"Failed to rename to stream");
+		return NtCurrentTeb()->LastErrorValue;
 	}
 
-	DS_DEBUG_LOG(L"successfully renamed file primary :$DATA ADS to specified stream, closing initial handle");
-	CloseHandle(hCurrent);
-	free(pfRename); // free memory allocated in ds_rename_handle
-	pfRename = NULL;
+	DS_DEBUG_LOG(L"Successfully renamed file primary :$DATA ADS to specified stream, closing initial handle");
+	NtClose(Current);
+	RtlFreeHeap(RtlProcessHeap(), 0, Rename); // free memory allocated in ds_rename_handle
+
 
 	// open another handle, trigger deletion on close
-	hCurrent = ds_open_handle(wcPath);
-	if (hCurrent == INVALID_HANDLE_VALUE)
-	{
-		DS_DEBUG_LOG(L"failed to reopen current module");
-		return 0;
+	Current = DsOpenHandle(Path);
+	if (Current == INVALID_HANDLE_VALUE) {
+		DS_DEBUG_LOG(L"Failed to reopen current module");
+		return NtCurrentTeb()->LastErrorValue;
 	}
 
-	if (!ds_deposite_handle(hCurrent))
-	{
-		DS_DEBUG_LOG(L"failed to set delete deposition");
-		return 0;
+	if (!DsDepositeHandle(Current)) {
+		DS_DEBUG_LOG(L"Failed to set delete deposition");
+		return NtCurrentTeb()->LastErrorValue;
 	}
 
 	// trigger the deletion deposition on hCurrent
-	DS_DEBUG_LOG(L"closing handle to trigger deletion deposition");
-	CloseHandle(hCurrent);
-
+	DS_DEBUG_LOG(L"Closing handle to trigger deletion deposition");
+	NtClose(Current);
+ 
 	// verify we've been deleted
-	if (PathFileExistsW(wcPath))
-	{
-		DS_DEBUG_LOG(L"failed to delete copy, file still exists");
-		return 0;
+	if (!RtlDosPathNameToNtPathName_U(Path, &Name, NULL, NULL)) {
+		DS_DEBUG_LOG(L"Failed to delete copy, file still exists");
+		return NtCurrentTeb()->LastErrorValue;
 	}
 
-	DS_DEBUG_LOG(L"successfully deleted self from disk");
-	return 1;
+	DS_DEBUG_LOG(L"Successfully deleted self from disk");
+	return ERROR_SUCCESS;
 }
